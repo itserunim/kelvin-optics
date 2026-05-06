@@ -3,9 +3,10 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import NeuCard from '@/components/NeuCard';
 import mqtt from 'mqtt';
+import { v4 as uuidv4 } from 'uuid'; // optional – replace with Date.now().toString(36) if needed
 
 interface ChatMessage {
-  id: number;
+  id: string;
   user: string;
   text: string;
   isSelf: boolean;
@@ -30,13 +31,16 @@ export default function WorldChat() {
   // ----- MQTT live messages -----
   const mqttClient = useRef<any>(null);
 
+  // Store the logged‑in username in a ref so we can filter MQTT messages
+  const currentUserRef = useRef<string | null>(null);
+
   // ----- Auto‑login -----
   useEffect(() => {
     const token = localStorage.getItem('token');
     const storedUser = localStorage.getItem('username');
     if (token && storedUser) {
       setIsLoggedIn(true);
-      setCredentials(prev => ({ ...prev, username: storedUser }));
+      currentUserRef.current = storedUser;
     }
   }, []);
 
@@ -64,7 +68,9 @@ export default function WorldChat() {
 
   // ----- MQTT subscription (live chat) -----
   useEffect(() => {
-    if (!isLoggedIn) return;
+    if (!isLoggedIn || !currentUserRef.current) return;
+
+    // Connect to the broker
     const client = mqtt.connect('ws://broker.hivemq.com:8000/mqtt', {
       clientId: 'chat_' + Math.random().toString(16).substr(2, 8),
     });
@@ -72,20 +78,51 @@ export default function WorldChat() {
 
     client.on('connect', () => {
       client.subscribe('kelvin/chat/in');
-      client.subscribe('kelvin/chat/out');   // to see replies from glasses
+      client.subscribe('kelvin/chat/out');   // to see replies from ESP32
     });
 
-    client.on('message', (topic: string, message: Buffer) => {
-      const data = JSON.parse(message.toString());
-      // Create a message object matching ChatMessage
-      const newMsg: ChatMessage = {
-        id: Date.now(),
-        user: data.user || 'kelvin_optics',
-        text: data.text || '',
-        isSelf: false,
-        createdAt: new Date().toISOString(),
-      };
-      setMessages(prev => [...prev, newMsg]);
+    client.on('message', async (topic: string, message: Buffer) => {
+      try {
+        const data = JSON.parse(message.toString());
+        const user = data.user || 'kelvin_optics';
+        const text = data.text || '';
+        const chatId = data.chatId || '';
+
+        // Ignore own messages – they are already added by the REST API
+        if (currentUserRef.current && user === currentUserRef.current) return;
+        if (!text.trim()) return;
+
+        // Persist the device message to the database
+        try {
+          const token = localStorage.getItem('token');
+          const res = await fetch('/api/chat/receive', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ user, text, chatId }),
+          });
+
+          if (res.ok) {
+            const saved = await res.json();
+            const newMsg: ChatMessage = {
+              id: String(saved.id),
+              user: saved.user,
+              text: saved.text,
+              isSelf: false,
+              createdAt: saved.createdAt,
+            };
+            setMessages(prev => [...prev, newMsg]);
+          } else {
+            console.error('Failed to persist device message');
+          }
+        } catch (err) {
+          console.error('Error calling chat/receive:', err);
+        }
+      } catch (err) {
+        console.error('Failed to parse MQTT message', message.toString());
+      }
     });
 
     return () => {
@@ -119,6 +156,9 @@ export default function WorldChat() {
       if (!res.ok) throw new Error(data.error || 'Something went wrong');
       localStorage.setItem('token', data.token);
       localStorage.setItem('username', data.username);
+
+      // Update the ref so MQTT filtering works immediately
+      currentUserRef.current = data.username;
       setIsLoggedIn(true);
       setCredentials({ username: "", password: "" });
       setConfirmPassword("");
@@ -152,6 +192,7 @@ export default function WorldChat() {
   const handleLogout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('username');
+    currentUserRef.current = null;
     setIsLoggedIn(false);
     setCredentials({ username: "", password: "" });
     setMessageInput("");
@@ -174,7 +215,9 @@ export default function WorldChat() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to send');
-      setMessages(prev => [...prev, data]);
+
+      // Append the message from REST (id from server is a number, convert to string)
+      setMessages(prev => [...prev, { ...data, id: String(data.id) }]);
       setMessageInput("");
       setTimeout(() => {
         if (chatContainerRef.current) {

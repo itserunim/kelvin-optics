@@ -20,5 +20,6 @@ model Message {
   text      String
   userId    Int
   user      User     @relation(fields: [userId], references: [id])
+  chatId    String?
   createdAt DateTime @default(now())
 }
